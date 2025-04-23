@@ -1,15 +1,31 @@
 import os
+import torch
 import tempfile
 from io import BytesIO
 import chromadb
 import ollama
-import streamlit as st
 from chromadb.utils.embedding_functions.ollama_embedding_function import OllamaEmbeddingFunction
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import CrossEncoder
-from streamlit.runtime.uploaded_file_manager import UploadedFile
+from flask import Flask, request, jsonify
+from flask_cors import CORS  # Importez CORS
+
+
+app = Flask(__name__)
+
+CORS(app)
+
+
+# Liste des fichiers PDF à utiliser (répertoire relatif)
+pdf_files = [
+    "./TR__Formations_EKIP_/TW_Formation GA EKIP360 - V2 (1).pdf",  
+    "./TR__Formations_EKIP_/TW_facturation_EKIP360.pdf",
+    "./TR__Formations_EKIP_/Documentation paramétrage de prestation (1).pdf",
+    "./TR__Formations_EKIP_/TW Formation-Prestation_V2 (1).pdf",
+    "./TR__Formations_EKIP_/TW-Formation Métiers (1).pdf"
+]
 
 # Chat system prompt
 system_prompt = """
@@ -28,14 +44,15 @@ To answer the question:
 Important: Base your entire response solely on the information provided in the context. Do not include any external knowledge or assumptions not present in the given text.
 """
 
-# Function to process the document and split it into chunks
-def process_document(uploaded_file: UploadedFile) -> list[Document]:
-    file_data = uploaded_file.read()
+# Fonction de traitement des documents et de découpe en morceaux
+def process_document(pdf_path: str) -> list[Document]:
+    with open(pdf_path, "rb") as f:
+        file_data = f.read()
     temp_file = BytesIO(file_data)
 
     with tempfile.NamedTemporaryFile("wb", suffix=".pdf", delete=False) as temp_pdf_file:
         temp_pdf_file.write(file_data)
-        temp_pdf_filename = temp_pdf_file.name
+        temp_pdf_filename = temp_pdf_file.name  # Get the path of the temp file
 
     loader = PyMuPDFLoader(temp_pdf_filename)
     docs = loader.load()
@@ -49,7 +66,7 @@ def process_document(uploaded_file: UploadedFile) -> list[Document]:
     )
     return text_splitter.split_documents(docs)
 
-# Function to get or create the vector collection
+# Fonction pour obtenir ou créer la collection vectorielle
 def get_vector_collection() -> chromadb.Collection:
     ollama_ef = OllamaEmbeddingFunction(
         url="http://localhost:11434/api/embeddings",
@@ -62,7 +79,7 @@ def get_vector_collection() -> chromadb.Collection:
         metadata={"hnsw:space": "cosine"},
     )
 
-# Function to add document chunks to the collection
+# Fonction pour ajouter les morceaux de documents à la collection vectorielle
 def add_to_vector_collection(all_splits: list[Document], file_name: str):
     collection = get_vector_collection()
     documents, metadatas, ids = [], [], []
@@ -77,90 +94,57 @@ def add_to_vector_collection(all_splits: list[Document], file_name: str):
         metadatas=metadatas,
         ids=ids,
     )
-    st.success("✅ Données ajoutées à la base vectorielle !")
 
-# Function to query the collection based on a prompt
+# Fonction pour interroger la collection vectorielle en fonction du prompt
 def query_collection(prompt: str, n_results: int = 10):
     collection = get_vector_collection()
     results = collection.query(query_texts=[prompt], n_results=n_results)
     return results
 
-# Function to call the LLM and generate a response
+# Fonction pour appeler le modèle LLM et générer une réponse
 def call_llm(context: str, prompt: str):
     response = ollama.chat(
         model="llama3.2:3b",
         stream=True,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Context: {context}, Question: {prompt}"}
-        ]
+        messages=[{"role": "system", "content": system_prompt},
+                  {"role": "user", "content": f"Context: {context}, Question: {prompt}"}]
     )
+    response_text = ""
     for chunk in response:
         if chunk["done"] is False:
-            yield chunk["message"]["content"]
+            response_text += chunk["message"]["content"]
         else:
             break
+    return response_text
 
-# Function to re-rank documents using a cross-encoder
-def re_rank_cross_encoders(documents: list[str]) -> tuple[str, list[int]]:
-    relevant_text = ""
-    relevant_text_ids = []
-
+# Fonction de re-rank des documents avec un modèle CrossEncoder
+def re_rank_cross_encoders(documents: list[str], prompt: str) -> str:
     encoder_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
     ranks = encoder_model.rank(prompt, documents, top_k=3)
+    relevant_text = ""
     for rank in ranks:
         relevant_text += documents[rank["corpus_id"]]
-        relevant_text_ids.append(rank["corpus_id"])
+    return relevant_text
 
-    return relevant_text, relevant_text_ids
+@app.route('/ask', methods=['POST'])
+def ask_question():
+    data = request.get_json()
+    if 'question' not in data:
+        return jsonify({'error': 'No question provided'}), 400
 
-# Page configuration
-st.set_page_config(page_title="💬 Chat avec vos documents", page_icon="📄")
-st.title("💬 Assistant IA Documentaire")
-st.markdown("Posez une question en lien avec le document que vous avez uploadé.")
-
-# Sidebar : chargement PDF
-with st.sidebar:
-    uploaded_file = st.file_uploader("📑 Upload PDF", type=["pdf"], accept_multiple_files=False)
-    process = st.button("⚡️ Process")
-    if uploaded_file and process:
-        all_splits = process_document(uploaded_file)
-        add_to_vector_collection(all_splits, uploaded_file.name)
-
-# Initialisation de l'historique de conversation
-if "conversation_history" not in st.session_state:
-    st.session_state.conversation_history = []
-
-# Affichage des messages précédents façon ChatGPT
-for entry in st.session_state.conversation_history:
-    with st.chat_message("user"):
-        st.markdown(entry["question"])
-    with st.chat_message("assistant"):
-        st.markdown(entry["response"])
-
-# Entrée utilisateur façon chat
-prompt = st.chat_input("Pose ta question ici...")
-
-# Traitement de la question
-if prompt:
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
+    prompt = data['question']
+    
+    # Query the collection based on the prompt
     results = query_collection(prompt)
     context = results.get("documents")[0]
-    relevant_text, relevant_text_ids = re_rank_cross_encoders(context)
-    response = call_llm(context=relevant_text, prompt=prompt)
+    
+    # Re-rank documents and get relevant content
+    relevant_text = re_rank_cross_encoders(context, prompt)
+    
+    # Get the response from the LLM model
+    response_text = call_llm(context=relevant_text, prompt=prompt)
+    
+    return jsonify({'answer': response_text})
 
-    # Affichage réponse IA avec spinner
-    with st.chat_message("assistant"):
-        with st.spinner("L'IA rédige sa réponse..."):
-            response_text = ""
-            for chunk in response:
-                response_text += chunk
-            st.markdown(response_text)
-
-    # Sauvegarde dans l'historique
-    st.session_state.conversation_history.append({
-        "question": prompt,
-        "response": response_text
-    })
+if __name__ == '__main__':
+    app.run(debug=True, host="0.0.0.0", port=5000)
